@@ -1,187 +1,187 @@
+#include "model.h"
 #include <stdio.h>
 #include <math.h>
 
+/* Minetti (2002) energy cost of running [J / (kg*m)] */
+double minetti_run(double slope) {
+    return 155.4 * pow(slope, 5) - 30.4 * pow(slope, 4) - 43.3 * pow(slope, 3) 
+         + 46.3 * pow(slope, 2) + 19.5 * slope + 3.6;
+}
 
+/* Minetti (2002) energy cost of walking [J / (kg*m)] */
+double minetti_walk(double slope) {
+    return 280.5 * pow(slope, 5) - 58.7 * pow(slope, 4) - 76.8 * pow(slope, 3) 
+         + 51.9 * pow(slope, 2) + 19.6 * slope + 2.5;
+}
 
-typedef struct {
-    double distance; // delta d_k [m]
-    double pente;    // i_k [sans unité, ex: 0.12 pour 12 %]
-} Segment;
-
-typedef struct {
-    double mass;     // m [kg]
-    double vma;      // VMA [km/h] (mettre 0 si inconnue)
-    double vo2max;   // VO2max [mL/(kg·min)] (mettre 0 si inconnue)
-    double height;   // taille [m] (pour le nombre de Froude)
-    double G0;       // Stock initial de glycogène [g]
-    double Rin_h;    // Apport nutritionnel [g/h]
-} Runner;
-
-typedef struct {
-    double I_opt;    // Intensité optimale trouvée [0, 1]
-    double t_tot;    // Temps total de course correspondant [s]
-    double G_final;  // Stock de glycogène à l'arrivée [g]
-} Result;
-
-// Calcule la puissance aérobie maximale nette P_max [W = J/s]
-// Priorité à la VMA si elle est renseignée, sinon utilisation de la VO2max.
-double calcul_Pmax(Runner c) {
+/* Computes net maximal aerobic power P_max [W = J/s].
+ * Prioritizes VMA if provided; otherwise estimates VMA from VO2max (Leger & Mercier, 1984).
+ */
+double compute_Pmax(Runner r) {
+    double pmax; 
     double vma_kmh = 0.0;
 
-    if (c.vma > 0.0) {
-        // Cas 1 (prioritaire) : VMA connue directement [km/h]
-        vma_kmh = c.vma;
-    } 
-    else if (c.vo2max > 0.0) {
-        // Cas 2 (repli) : estimation de la VMA [km/h] via Léger & Mercier (1984)
-        vma_kmh = c.vo2max / 3.5;
-    } 
-    else {
-        fprintf(stderr, "Erreur : fournir une VMA ou une VO2max valide.\n");
+    if (r.vma > 0.0) {
+        vma_kmh = r.vma;
+    } else if (r.vo2max > 0.0) {
+        vma_kmh = r.vo2max / 3.5;
+    } else {
+        fprintf(stderr, "Error: provide a valid VMA (> 0) or VO2max (> 0).\n");
         return -1.0;
     }
 
-    // Conversion en m/s et calcul de P_max cohérent avec Minetti sur le plat
+    // Convert to m/s and compute P_max
     double vma_ms = vma_kmh / 3.6;
-    return minetti_run(0.0) * c.mass * vma_ms;
+    pmax = minetti_run(0.0) * r.mass * vma_ms;
+    return pmax;
 }
 
-
-/* simule_course :
-   paramètre : data coureur, data segments, I
-   utilise : calcul_ttot et bilan_glucidique
-   return Gfinal et son temps total
-
-   calcul_ttot :
-   paramètre : I, data coureur, data segments
-   utilise : minetti course / marche
-   calcul : vk
-   return : ttot
-
-   bilan_glucidique :
-   paramètre : data coureur, ttot
-   calcul : Gfinal = G0 + (Rin - Rout) ttot
-   utilise : calcul_ttot
-   return Gfinal
-
-   minetti course / marche :
-   paramètre : pente i d'un segment (data coureur)
-   return : coût du terrain
-*/
-
-double minetti_run(double i) {
-    return 155.4 * pow(i, 5) - 30.4 * pow(i, 4) - 43.3 * pow(i, 3) 
-         + 46.3 * pow(i, 2) + 19.5 * i + 3.6;
+/* Computes individual run-to-walk transition speed [m/s] via the Froude number */
+double compute_v_trans(double height) {
+    double leg_length = LEG_LENGTH_RATIO * height;
+    return sqrt(FROUDE_UPHILL * G_GRAVITY * leg_length);
 }
 
-double minetti_walk(double i) {
-    return 280.5 * pow(i, 5) - 58.7 * pow(i, 4) - 76.8 * pow(i, 3) 
-         + 51.9 * pow(i, 2) + 19.6 * i + 2.5;
+/* Computes exogenous carbohydrate oxidation efficiency (eta)
+ * from intake rate Rin_h [g/h] (calibrated on Podlogar et al., 2022; Hearris et al., 2022).
+ */
+double compute_carb_efficiency(double Rin_h) {
+    if (Rin_h <= 60.0) {
+        // Regime 1: moderate intake (<= 60 g/h), constant 95% efficiency
+        return 0.95;
+    } else if (Rin_h <= 120.0) {
+        // Regime 2: linear decrease from 95% (at 60 g/h) to 75% (at 120 g/h)
+        // y = a * x + b passing through (60, 0.95) and (120, 0.75)
+        double a = (0.75 - 0.95) / (120.0 - 60.0);
+        double b = 0.95 - a * 60.0;
+        return a * Rin_h + b;
+    } else {
+        // Regime 3: intestinal saturation above 120 g/h, effective uptake capped at 90 g/h
+        return 90.0 / Rin_h;
+    }
 }
 
-
-#define PENTE_LIMITE 0.45
-#define PENTE_MIN_MARCHE 0.05
-
-// Calcule le temps total de course (en secondes) pour une puissance cible donnée
-double calcul_ttot(double P_cible, double masse, double v_trans,
-                   const Segment parcours[], int nb_segments) {
+/* Computes total race time [s] for a given target power P_target [W] */
+double compute_total_time(double P_target, double mass, double v_trans,
+                          const Segment course[], int n_segments) {
     double t_tot = 0.0;
 
-    for (int k = 0; k < nb_segments; k++) {
-        double i_k = parcours[k].pente;
+    for (int k = 0; k < n_segments; k++) {
+        double i_k = course[k].slope;
 
-        // Sécurité : borner la pente dans le domaine de validité de Minetti [-45 %, +45 %]
-        if (i_k > PENTE_LIMITE) {
-            i_k = PENTE_LIMITE;
-        } else if (i_k < -PENTE_LIMITE) {
-            i_k = -PENTE_LIMITE;
+        // Minetti polynomial validity domain [-45%, +45%]
+        if (i_k > MAX_SLOPE) {
+            i_k = MAX_SLOPE;
+        } else if (i_k < -MAX_SLOPE) {
+            i_k = -MAX_SLOPE;
         }
 
-        // 1. Calcul de la vitesse théorique en courant (m/s)
-        double v_k = P_cible / (minetti_run(i_k) * masse);
+        // 1. Theoretical running speed [m/s]
+        double v_k = P_target / (minetti_run(i_k) * mass);
 
-        // 2. Transition dynamique vers la marche si montée et vitesse sous le seuil
-        if (i_k > PENTE_MIN_MARCHE && v_k <= v_trans) {
-            v_k = P_cible / (minetti_walk(i_k) * masse);
+        // 2. Dynamic transition to walking on uphills below transition speed
+        if (i_k > MIN_WALK_SLOPE && v_k <= v_trans) {
+            v_k = P_target / (minetti_walk(i_k) * mass);
         }
 
-        // 3. Accumulation du temps passé sur le segment (dt_k = delta_d_k / v_k)
-        t_tot += parcours[k].distance / v_k;
+        // 3. Accumulate segment time [s]
+        t_tot += course[k].distance / v_k;
     }
 
     return t_tot;
 }
 
-
-
-#define G_GRAVITY 9.81
-#define FROUDE 0.28   // Nombre de Froude critique en côte
-#define LEG_LENGTH 0.53   // Longueur de jambe ≈ 53 % de la taille
-
-// À appeler une seule fois dans simule_course ou à la lecture du coureur
-double calcul_v_trans(double taille) {
-    double L_jambe = LEG_LENGTH * taille;
-    return sqrt(FROUDE * G_GRAVITY * L_jambe);
-}
-
-
-// Rendement d'oxydation exogène (eta) selon l'apport horaire [g/h]
-// (Jeukendrup, 2014 ; Pfeiffer et al., 2011 ; Hearris et al., 2022)
-static double calcul_rendement(double Rin_h) {
-    if (Rin_h <= 60.0) {
-        return 0.95;
-    } else if (Rin_h <= 120.0) {
-        return 0.95 - 0.20 * ((Rin_h - 60.0) / 60.0);
-    } else {
-        return 0.75;
-    }
-}
-// Calcule le rendement d'absorption intestinale eta
-// en fonction de l'apport en glucides ingéré (Rin_h, en g/h).
-// Paramétrisation basée sur les données d'oxydation exogène (Podlogar et al., 2022 ; Hearris et al., 2022).
-double calcul_rendement(double Rin_h) {
-    if (Rin_h <= 60.0) {
-        return 0.95; // Rendement maximal constant de 95 %
-    } 
-    else if (Rin_h <= 120.0) {
-        // Régime 2 : Décroissance linéaire de 95 % (à 60 g/h) jusqu'à 75 % (à 120 g/h)
-        // Droite y = b + a*x passant par (60 ; 0.95) et (120 ; 0.75)
-        
-        double a = 0.75 - 0.95 / (120.0 - 60.0); 
-        double b = 0.95 - a * 60.0;
-        return a * Rin_h + b;
-    } 
-    else {
-       return 0.75; // Rendement minimal constant de 75 % au-delà de 120 g/h
-    }
-}
-
-#define ENERGIE_GLYCOGENE 16736.0 // Énergie libérée par 1 g de glycogène [J/g]
-
-// Calcule le stock de glycogène restant à l'arrivée
-double bilan_glucidique(double I, double P_cible, double t_tot, double G0, double Rin_h) {
+/* Computes remaining glycogen stock at the finish line [g] */
+double compute_carb_balance(double I, double P_target, double t_tot,
+                            double G0, double Rin_h) {
     double Gfinal = G0;
+    // 1. Exogenous carbohydrate inflow [g]
+    double eta = compute_efficiency(Rin_h);
+    double Rin_s = Rin_h / 3600.0; // Convert g/h to g/s
+    double total_intake = eta * Rin_s * t_tot;
 
-    // 1. Flux entrant : 
-    double eta = calcul_rendement(Rin_h); // rendement 
-    double Rin_s = Rin_h / 3600.0; // conversion de g/h en g/s 
-    double input_total = eta * Rin_s * t_tot;
+    // 2. Carbohydrate oxidation outflow using Brooks crossover f(I) = I^2 [g]
+    double P_carb = P_target * I * I;              // [W = J/s]
+    double Rout_s = P_carb / GLYCOGEN_ENERGY;      // [g/s]
+    double total_expenditure = Rout_s * t_tot;
 
-    // 2. Flux sortant : part glucidique selon Brooks f(I) = I^2
-    double P_glucides = P_cible * I * I;            // [W] = [J/s]
-    double Rout_s = P_glucides / ENERGIE_GLYCOGENE; // [g/s]
-    double output_total = Rout_s * t_tot;
-
-    // 3. Bilan final du réservoir [g]
-    Gfinal = G0 + input_total - output_total;
+    // 3. Final glycogen balance [g]
+    Gfinal = G0 + total_intake - total_expenditure;
 
     return Gfinal;
 }
 
-/* findIopt :
-   paramètre : data coureur, data segments
-   utilise : simule_course
-   return : Iopt
-*/
+/* Simulates the full race at a given relative intensity I.
+ * Returns final glycogen [g] and optionally writes total time [s] to *t_tot_out.
+ */
+double simulate_race(double I, Runner r, const Segment course[],
+                     int n_segments, double *t_tot_out) {
+    double P_max = compute_Pmax(r);
+    if (P_max <= 0.0) {
+        return -1.0;
+    }
 
+    double P_target = P_max * I;
+    double v_trans = compute_v_trans(r.height);
+
+    double t_tot = compute_total_time(P_target, r.mass, v_trans, course, n_segments);
+    if (t_tot_out != NULL) {
+        *t_tot_out = t_tot;
+    }
+
+    double Gfinal = compute_carb_balance(I, P_target, t_tot, r.G0, r.Rin_h);
+    return Gfinal;
+}
+
+/* Finds the optimal intensity I via binary search so that G_final = 10% of G0 */
+Result find_I_opt(Runner r, const Segment course[], int n_segments) {
+    Result res = {0.0, 0.0, 0.0};
+    double G_target = WALL_THRESHOLD * r.G0;
+
+    double I_low = 0.05;     // Lower bound (5% of P_max, avoids division by zero)
+    double I_high = 1.00;    // Upper bound (100% of P_max)
+    double tol = 1e-5;       // Convergence tolerance on I
+    int max_iter = 100;      // Safety limit
+
+    double t_test = 0.0;
+
+    // Edge case 1: race is short enough that full intensity stays above the wall
+    double G_max_effort = simulate_race(I_high, r, course, n_segments, &t_test);
+    if (G_max_effort >= G_target) {
+        res.I_opt = I_high;
+        res.t_tot = t_test;
+        res.G_final = G_max_effort;
+        return res;
+    }
+
+    // Edge case 2: even at minimum intensity, the runner hits the wall
+    double G_min_effort = simulate_race(I_low, r, course, n_segments, &t_test);
+    if (G_min_effort <= G_target) {
+        res.I_opt = I_low;
+        res.t_tot = t_test;
+        res.G_final = G_min_effort;
+        return res;
+    }
+
+    // Main binary search loop
+    double I_mid = 0.5;
+    double G_mid = 0.0;
+    int iter = 0;
+
+    while ((I_high - I_low) > tol && iter < max_iter) {
+        I_mid = 0.5 * (I_low + I_high);
+        G_mid = simulate_race(I_mid, r, course, n_segments, &t_test);
+
+        if (G_mid > G_target) {
+            I_low = I_mid;   // Surplus glycogen: runner can push harder
+        } else {
+            I_high = I_mid;  // Below wall threshold: runner must slow down
+        }
+        iter++;
+    }
+
+    res.I_opt = I_mid;
+    res.t_tot = t_test;
+    res.G_final = G_mid;
+    return res;
+}
