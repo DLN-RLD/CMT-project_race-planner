@@ -1,0 +1,10 @@
+# Runner biometrics and nutrition strategy
+# Units: kg, km/h, mL/(kg*min), m, g, g/h
+# Provide either vma OR vo2max (vma takes priority if both are set)
+
+mass   70.0
+vma    18.0
+# vo2max 63.0
+height 1.75
+G0     500.0
+Rin_h  75.0

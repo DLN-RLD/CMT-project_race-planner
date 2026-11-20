@@ -96,7 +96,7 @@ double compute_carb_balance(double I, double P_target, double t_tot,
                             double G0, double Rin_h) {
     double Gfinal = G0;
     // 1. Exogenous carbohydrate inflow [g]
-    double eta = compute_efficiency(Rin_h);
+    double eta = compute_carb_efficiency(Rin_h);
     double Rin_s = Rin_h / 3600.0; // Convert g/h to g/s
     double total_intake = eta * Rin_s * t_tot;
 
