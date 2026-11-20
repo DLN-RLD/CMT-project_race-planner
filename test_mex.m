@@ -1,25 +1,38 @@
-addpath("bin");
+clear; clc;
 
+addpath("bin");
 if ~isfile(fullfile("bin", "mex_solver." + mexext))
     mex -R2018a src/codeC/mex_solver.c src/codeC/model.c -Isrc/codeC -outdir bin
 end
 
-% Test parcours factice de 40 km
-distances = [15000; 10000; 15000];
-slopes    = [0.10;   0.00; -0.10];
+% Parcours test
+distances = [20000; 20000; 10000];
+slopes    = [0.10;    0.00; -0.10];
 
+% Profil coureur
 runner.mass   = 70.0;
-runner.vma    = 15.0;
+runner.vma    = 17.0;
 runner.height = 1.75;
-runner.G0     = 500.0;
-runner.Rin_h  = 0.0;
-
-% call C code 
-[I_opt, t_tot, G_final, profile] = mex_solver(distances, slopes, runner);
+runner.G0     = 400.0;
 
 
+% Comparaison des stratégies glucidiques
+Rin_list  = [0; 30; 60; 90; 120];
+n_cases   = length(Rin_list);
 
-fprintf("Intensité optimale : %.2f %%\n", I_opt * 100);
-fprintf("Temps prédit       : %s (%.1f s)\n", char(duration(0, 0, t_tot)), t_tot);
-fprintf("Glycogène final    : %.1f g / %.1f g\n", G_final, runner.G0);
-disp(profile);
+temps_str = strings(n_cases, 1);
+G_fin_g   = zeros(n_cases, 1);
+limite    = strings(n_cases, 1);
+
+for k = 1:n_cases
+    runner.Rin_h = Rin_list(k);
+    [~, t_k, G_fin_k, prof_k] = mex_solver(distances, slopes, runner);
+
+    temps_str(k) = string(duration(0, 0, round(t_k)));
+    G_fin_g(k)   = round(G_fin_k, 1);
+    limite(k)    = string(prof_k.limiting_factor);
+end
+
+T = table(Rin_list, temps_str, G_fin_g, limite, ...
+    'VariableNames', {'Rin_g_h', 'Temps', 'G_final_g', 'Limite'});
+disp(T);
