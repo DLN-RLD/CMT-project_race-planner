@@ -5,10 +5,8 @@
 /* ========================================================================= */
 /* Internal numeric tolerances & helper                                      */
 /* ========================================================================= */
-#define WALK_BISECT_ITERS   30
-#define OUTER_SCAN_STEPS    20
-#define OUTER_BISECT_ITERS  30
-#define MIN_SPEED_MS        1e-6
+#define BISECT_ITERS   30
+#define MIN_SPEED_MS   1e-6
 
 static double clamp_slope(double slope) {
     if (slope >  MAX_SLOPE) return  MAX_SLOPE;
@@ -90,36 +88,26 @@ double peronnet_I_max(double t_s, double endurance_index) {
 /* Layer 2: Local segment physics                                            */
 /* ========================================================================= */
 
-/* Analytical inversion of RE3 for running speed v_run [m/s] */
+/* Numerical inversion of RE3 for running speed v_run [m/s] */
 double re3_run_speed(double M_target, double slope) {
-    if (M_target <= RE3_INTERCEPT) return 0.0;
-    slope = clamp_slope(slope);
-
-    double G_pct = 100.0 * slope;
-    double a = 0.37;
-    double b = 1.51 + 30.43 * slope * (1.0 - pow(1.133, 1.0 - pow(1.056, G_pct + 43.0)));
-    double c = RE3_INTERCEPT - M_target;
-
-    double disc = b * b - 4.0 * a * c;
-    if (disc <= 0.0) return 0.0;
-
-    double v = (-b + sqrt(disc)) / (2.0 * a);
-    return (v > 0.0) ? v : 0.0;
+    double lo = 0.0;
+    double hi = 10.0; /* 36 km/h */
+    for (int iter = 0; iter < BISECT_ITERS; iter++) {
+        double mid = 0.5 * (lo + hi);
+        if (re3_run_power(mid, slope) < M_target) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return 0.5 * (lo + hi);
 }
 
 /* Numerical inversion of LCDA for walking speed v_walk [m/s] */
 double lcda_walk_speed(double M_target, double slope, double v_low) {
-    if (M_target <= LCDA_STANDING_M) return 0.0;
-    slope = clamp_slope(slope);
-
-    double lo = (v_low > 0.0) ? v_low : 0.0;
-    double hi = (lo > 4.0) ? (lo + 1.0) : 4.0;
-
-    while (lcda_walk_power(hi, slope) < M_target && hi < 20.0) {
-        hi *= 1.5;
-    }
-
-    for (int iter = 0; iter < WALK_BISECT_ITERS; iter++) {
+    double lo = v_low;
+    double hi = 4.0; /* 14.4 km/h */
+    for (int iter = 0; iter < BISECT_ITERS; iter++) {
         double mid = 0.5 * (lo + hi);
         if (lcda_walk_power(mid, slope) < M_target) {
             lo = mid;
@@ -133,7 +121,6 @@ double lcda_walk_speed(double M_target, double slope, double v_low) {
 /* Solve locomotion mode, speed, and actual power on a single segment */
 SegmentState solve_segment(Runner r, double slope, double M_target) {
     SegmentState st;
-    slope = clamp_slope(slope);
 
     /* 1. Running speed from RE3 */
     double v_run = re3_run_speed(M_target, slope);
@@ -142,7 +129,7 @@ SegmentState solve_segment(Runner r, double slope, double M_target) {
     st.is_walking = 0.0;
 
     /* 2. Continuous walk/run transition (EOTS: v_k = max(v_run, v_walk)) */
-    if (v_run == 0.0 || lcda_walk_power(v_run, slope) < M_target) {
+    if (lcda_walk_power(v_run, slope) < M_target) {
         st.speed_ms   = lcda_walk_speed(M_target, slope, v_run);
         st.is_walking = 1.0;
     }
@@ -185,6 +172,7 @@ void simulate_course(Runner r, const Segment course[], int n_segments,
         double dt    = course[k].distance / st.speed_ms;
         double I_k   = st.M_actual / M_max;
         double fc    = rapoport_cho_fraction(I_k);
+
         double R_out = (r.mass * st.M_actual * fc) / GLYCOGEN_ENERGY;
 
         t_acc     += dt;
@@ -217,7 +205,7 @@ double solve_I_glyc(Runner r, const Segment course[], int n_segments, double M_m
     double high  = 1.0;
     double low   = I_min;
 
-    for (int iter = 0; iter < OUTER_BISECT_ITERS; iter++) {
+    for (int iter = 0; iter < BISECT_ITERS; iter++) {
         double mid = 0.5 * (low + high);
         simulate_course(r, course, n_segments, mid, NULL, NULL, &g_min_tmp, NULL);
         if (g_min_tmp >= G_floor) {
@@ -236,7 +224,7 @@ double solve_I_aero(Runner r, const Segment course[], int n_segments, double M_m
     double t_tmp = 0.0;
     double high  = 1.0;
    
-    for (int iter = 0; iter < OUTER_BISECT_ITERS; iter++) {
+    for (int iter = 0; iter < BISECT_ITERS; iter++) {
         double mid = 0.5 * (low + high);
         simulate_course(r, course, n_segments, mid, &t_tmp, NULL, NULL, NULL);
         if (mid < peronnet_I_max(t_tmp, E)) {
