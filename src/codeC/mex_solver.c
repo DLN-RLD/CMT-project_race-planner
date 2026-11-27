@@ -26,33 +26,32 @@ void mexFunction(int nlhs, mxArray *plhs[],
     double *slp_in  = mxGetDoubles(prhs[1]);
 
     Runner r;
-    r.mass   = get_struct_scalar(prhs[2], "mass",   0.0, 1);
-    r.height = get_struct_scalar(prhs[2], "height", 0.0, 1);
-    r.G0     = get_struct_scalar(prhs[2], "G0",     0.0, 1);
-    r.Rin_h  = get_struct_scalar(prhs[2], "Rin_h",  0.0, 1);
-    r.vma    = get_struct_scalar(prhs[2], "vma",    0.0, 0);
-    r.vo2max = get_struct_scalar(prhs[2], "vo2max", 0.0, 0);
+    r.mass            = get_struct_scalar(prhs[2], "mass",            0.0, 1);
+    r.G0              = get_struct_scalar(prhs[2], "G0",              0.0, 1);
+    r.Rin_h           = get_struct_scalar(prhs[2], "Rin_h",           0.0, 1);
+    r.vma             = get_struct_scalar(prhs[2], "vma",             0.0, 0);
+    r.vo2max          = get_struct_scalar(prhs[2], "vo2max",          0.0, 0);
     r.endurance_index = get_struct_scalar(prhs[2], "endurance_index", DEFAULT_ENDURANCE_INDEX, 0);
-    r.terrain_factor  = get_struct_scalar(prhs[2], "terrain_factor",  DEFAULT_TERRAIN_FACTOR,  0);
-    r.fatigue_rate    = get_struct_scalar(prhs[2], "fatigue_rate",    DEFAULT_FATIGUE_RATE,    0);
+    r.Rmax_h          = get_struct_scalar(prhs[2], "Rmax_h",          DEFAULT_RMAX_MIX,        0);
+    r.v_downhill_max  = get_struct_scalar(prhs[2], "v_downhill_max",  0.0,                     0);
 
-    if (r.mass <= 0.0 || r.height <= 0.0 || r.G0 <= 0.0 || r.Rin_h < 0.0) {
+    if (r.mass <= 0.0 || r.G0 <= 0.0 || r.Rin_h < 0.0) {
         mexErrMsgIdAndTxt("TrailSolver:invalidBiometrics",
-                          "mass, height, and G0 must be > 0, and Rin_h must be >= 0.");
+                          "mass and G0 must be > 0, and Rin_h must be >= 0.");
     }
     if (r.endurance_index >= 0.0) {
         mexErrMsgIdAndTxt("TrailSolver:invalidEndurance",
                           "endurance_index must be strictly negative (e.g. -7.5).");
     }
-    if (r.terrain_factor <= 0.0) {
-        mexErrMsgIdAndTxt("TrailSolver:invalidTerrain",
-                          "terrain_factor must be strictly positive (e.g. 1.10).");
+    if (r.Rmax_h < 0.0) {
+        mexErrMsgIdAndTxt("TrailSolver:invalidRmax",
+                          "Rmax_h must be >= 0 (e.g. 60 or 90 g/h, 0 = uncapped).");
     }
-    if (r.fatigue_rate < 0.0) {
-        mexErrMsgIdAndTxt("TrailSolver:invalidFatigue",
-                          "fatigue_rate must be >= 0 (e.g. 0.0015).");
+    if (r.v_downhill_max < 0.0) {
+        mexErrMsgIdAndTxt("TrailSolver:invalidDownhillCap",
+                          "v_downhill_max must be >= 0 (0 = disabled).");
     }
-    if (compute_Pmax(r) <= 0.0) {
+    if (compute_M_max(r) <= 0.0) {
         mexErrMsgIdAndTxt("TrailSolver:invalidAerobicCapacity",
                           "Provide a valid vma (> 0) or vo2max (> 0) in runner struct.");
     }

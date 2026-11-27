@@ -1,240 +1,277 @@
 #include "model.h"
-#include <stdio.h>
 #include <math.h>
+#include <stddef.h>
 
-/* Minetti (2002) energy cost of running [J / (kg*m)] */
-double minetti_run(double slope) {
-    return 155.4 * pow(slope, 5) - 30.4 * pow(slope, 4) - 43.3 * pow(slope, 3) 
-         + 46.3 * pow(slope, 2) + 19.5 * slope + 3.6;
+/* ========================================================================= */
+/* Internal numeric tolerances & helper                                      */
+/* ========================================================================= */
+#define WALK_BISECT_ITERS   30
+#define OUTER_SCAN_STEPS    20
+#define OUTER_BISECT_ITERS  30
+#define MIN_SPEED_MS        1e-6
+
+static double clamp_slope(double slope) {
+    if (slope >  MAX_SLOPE) return  MAX_SLOPE;
+    if (slope < -MAX_SLOPE) return -MAX_SLOPE;
+    return slope;
 }
 
-/* Minetti (2002) energy cost of walking [J / (kg*m)] */
-double minetti_walk(double slope) {
-    return 280.5 * pow(slope, 5) - 58.7 * pow(slope, 4) - 76.8 * pow(slope, 3) 
-         + 51.9 * pow(slope, 2) + 19.6 * slope + 2.5;
-}
+/* ========================================================================= */
+/* Layer 1: Elemental published equations                                    */
+/* ========================================================================= */
 
-double downhill_pace_factor(double i) {
-    /* Empirical downhill braking curve (min 0.88 at -9%, 1.0 at -18%, braking beyond) */
-    double d = i + 0.09;
-    return 0.88 + (0.12 / (0.09 * 0.09)) * d * d;
-}
-
-/* Computes net maximal aerobic power P_max [W = J/s].
- * Prioritizes VMA if provided; otherwise estimates VMA from VO2max (Leger & Mercier, 1984).
- */
-double compute_Pmax(Runner r) {
-    double pmax; 
-    double vma_kmh = 0.0;
-
+/* Gross maximal aerobic metabolic power [W/kg] */
+double compute_M_max(Runner r) {
+    if (r.vo2max > 0.0) {
+        return (r.vo2max * O2_ENERGY_EQ) / 60.0;
+    }
     if (r.vma > 0.0) {
-        vma_kmh = r.vma;
-    } else if (r.vo2max > 0.0) {
-        vma_kmh = r.vo2max / 3.5;
-    } else {
-        fprintf(stderr, "Error: provide a valid VMA (> 0) or VO2max (> 0).\n");
-        return -1.0;
+        double vma_ms = r.vma / 3.6;
+        return re3_run_power(vma_ms, 0.0);
     }
-    // Convert to m/s and compute P_max
-    double vma_ms = vma_kmh / 3.6;
-    pmax = minetti_run(0.0) * r.mass * vma_ms;
-    return pmax;
+    return 0.0;
 }
 
-/* Computes individual run-to-walk transition speed [m/s] via the Froude number */
-double compute_v_trans(double height) {
-    double leg_length = LEG_LENGTH_RATIO * height;
-    return sqrt(FROUDE_UPHILL * G_GRAVITY * leg_length);
+/* RE3 running gross metabolic power [W/kg] (Looney, Hoogkamer & Kram, 2025/2026) */
+double re3_run_power(double speed_ms, double slope) {
+    slope = clamp_slope(slope);
+
+    double G_pct = 100.0 * slope;
+    double grade_coeff = 30.43 * slope * (1.0 - pow(1.133, 1.0 - pow(1.056, G_pct + 43.0)));
+    return RE3_INTERCEPT + (1.51 + grade_coeff) * speed_ms + 0.37 * speed_ms * speed_ms;
 }
 
-/* Computes exogenous carbohydrate oxidation efficiency (eta)
- * from intake rate Rin_h [g/h] (calibrated on Podlogar et al., 2022; Hearris et al., 2022).
- */
-double compute_carb_efficiency(double Rin_h) {
-    if (Rin_h <= 60.0) {
-        // Regime 1: moderate intake (<= 60 g/h), constant 95% efficiency
-        return 0.95;
-    } else if (Rin_h <= 120.0) {
-        // Regime 2: linear decrease from 95% (at 60 g/h) to 75% (at 120 g/h)
-        // y = a * x + b passing through (60, 0.95) and (120, 0.75)
-        double a = (0.75 - 0.95) / (120.0 - 60.0);
-        double b = 0.95 - a * 60.0;
-        return a * Rin_h + b;
-    } else {
-        // Regime 3: intestinal saturation above 120 g/h, effective uptake capped at 90 g/h
-        return 90.0 / Rin_h;
-    }
+/* LCDA walking gross metabolic power [W/kg] (Looney et al., 2019) */
+double lcda_walk_power(double speed_ms, double slope) {
+    slope = clamp_slope(slope);
+
+    double G_pct = 100.0 * slope;
+    double v2 = speed_ms * speed_ms;
+    double v4 = v2 * v2;
+    double grade_term = 0.34 * speed_ms * G_pct * (1.0 - pow(1.05, 1.0 - pow(1.1, G_pct + 32.0)));
+    return LCDA_STANDING_M + 1.94 * pow(speed_ms, 0.43) + 0.24 * v4 + grade_term;
 }
-/* returns the maximum fraction of VMA that a runner with an endurance index 
- *is physiologically capable of maintaining continuously.
- */
+
+/* Carbohydrate oxidation fraction f_c(I) [-] (Rapoport, 2010 / Romijn et al., 1993) */
+double rapoport_cho_fraction(double I_gross) {
+    /* Romijn et al. (1993) reference points at 25%, 65%, 85%, and 100% VO2max */
+    double I1 = 0.25, F1 = 0.11;
+    double I2 = 0.65, F2 = 0.52;
+    double I3 = 0.85, F3 = 0.77;
+    double I4 = 1.00, F4 = 1.00;
+
+    if (I_gross <= 0.0) return 0.0;
+    if (I_gross <= I1)  return F1 * (I_gross / I1);
+    if (I_gross <= I2)  return F1 + (F2 - F1) * (I_gross - I1) / (I2 - I1);
+    if (I_gross <= I3)  return F2 + (F3 - F2) * (I_gross - I2) / (I3 - I2);
+    if (I_gross <  I4)  return F3 + (F4 - F3) * (I_gross - I3) / (I4 - I3);
+    return 1.0;
+}
+
+/* Exogenous CHO oxidation rate [g/s] (Jeukendrup, 2014) */
+double jeukendrup_exo_rate(double Rin_h, double Rmax_h) {
+    if (Rin_h == 0.0) return 0.0;
+    if (Rmax_h > 0.0 && Rin_h > Rmax_h) {
+        return Rmax_h / 3600.0;
+    }
+    return Rin_h / 3600.0;
+}
+
+/* Aerobic intensity ceiling I_max(T) [-] (Peronnet & Thibault, 1989) */
 double peronnet_I_max(double t_s, double endurance_index) {
-    if (t_s <= PERONNET_T_MAP) {
-        return 1.0;
-    }
-    // val decreases logarithmically with time
-    double val = 1.0 + (endurance_index / 100.0) * log(t_s / PERONNET_T_MAP);
-    if (val > 1.0) {
-        return 1.0;
-    }
-    if (val < 0.05) {
-        return 0.05;
-    }
-    return val;
+    if (t_s <= PERONNET_T_MAP) return 1.0;
+    double I_max = 1.0 + (endurance_index / 100.0) * log(t_s / PERONNET_T_MAP);
+    if (I_max < 0.0) return 0.0;
+    if (I_max > 1.0) return 1.0;
+    return I_max;
 }
 
+/* ========================================================================= */
+/* Layer 2: Local segment physics                                            */
+/* ========================================================================= */
 
-/* Simulates the full race at a given relative intensity I.
- * Returns final glycogen [g] and optionally writes total time [s] to *t_tot_out.
- */
+/* Analytical inversion of RE3 for running speed v_run [m/s] */
+double re3_run_speed(double M_target, double slope) {
+    if (M_target <= RE3_INTERCEPT) return 0.0;
+    slope = clamp_slope(slope);
+
+    double G_pct = 100.0 * slope;
+    double a = 0.37;
+    double b = 1.51 + 30.43 * slope * (1.0 - pow(1.133, 1.0 - pow(1.056, G_pct + 43.0)));
+    double c = RE3_INTERCEPT - M_target;
+
+    double disc = b * b - 4.0 * a * c;
+    if (disc <= 0.0) return 0.0;
+
+    double v = (-b + sqrt(disc)) / (2.0 * a);
+    return (v > 0.0) ? v : 0.0;
+}
+
+/* Numerical inversion of LCDA for walking speed v_walk [m/s] */
+double lcda_walk_speed(double M_target, double slope, double v_low) {
+    if (M_target <= LCDA_STANDING_M) return 0.0;
+    slope = clamp_slope(slope);
+
+    double lo = (v_low > 0.0) ? v_low : 0.0;
+    double hi = (lo > 4.0) ? (lo + 1.0) : 4.0;
+
+    while (lcda_walk_power(hi, slope) < M_target && hi < 20.0) {
+        hi *= 1.5;
+    }
+
+    for (int iter = 0; iter < WALK_BISECT_ITERS; iter++) {
+        double mid = 0.5 * (lo + hi);
+        if (lcda_walk_power(mid, slope) < M_target) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return 0.5 * (lo + hi);
+}
+
+/* Solve locomotion mode, speed, and actual power on a single segment */
+SegmentState solve_segment(Runner r, double slope, double M_target) {
+    SegmentState st;
+    slope = clamp_slope(slope);
+
+    /* 1. Running speed from RE3 */
+    double v_run = re3_run_speed(M_target, slope);
+    st.speed_ms   = v_run;
+    st.M_actual   = M_target;
+    st.is_walking = 0.0;
+
+    /* 2. Continuous walk/run transition (EOTS: v_k = max(v_run, v_walk)) */
+    if (v_run == 0.0 || lcda_walk_power(v_run, slope) < M_target) {
+        st.speed_ms   = lcda_walk_speed(M_target, slope, v_run);
+        st.is_walking = 1.0;
+    }
+
+    /* 3. Optional biomechanical downhill speed cap */
+    if (slope < 0.0 && r.v_downhill_max > 0.0 && st.speed_ms > r.v_downhill_max) {
+        st.speed_ms = r.v_downhill_max;
+        if (st.is_walking > 0.5) {
+            st.M_actual = lcda_walk_power(st.speed_ms, slope);
+        } else {
+            st.M_actual = re3_run_power(st.speed_ms, slope);
+        }
+    }
+
+    return st;
+}
+
+/* ========================================================================= */
+/* Layer 3: Course simulation & global optimization                          */
+/* ========================================================================= */
+
 void simulate_course(Runner r, const Segment course[], int n_segments,
                      double I_target, double *t_tot, double *G_final,
                      double *G_min, ProfileArrays *prof) {
-    double P_max     = compute_Pmax(r);
-    double P_target  = P_max * I_target;
-    double v_trans   = compute_v_trans(r.height);
-    double Rin_net_s = compute_carb_efficiency(r.Rin_h) * (r.Rin_h / 3600.0); 
-    double P_bmr     = BMR_PER_KG * r.mass;                                   
-    double c_flat_0  = minetti_run(0.0);
+    double M_max    = compute_M_max(r);
+    double M_target = M_max * I_target;
+    double R_exo    = jeukendrup_exo_rate(r.Rin_h, r.Rmax_h);
 
-    double cum_dist  = 0.0;
-    double cum_time  = 0.0;
+    double t_acc     = 0.0;
+    double d_acc     = 0.0;
     double G_current = r.G0;
-    double g_min_val = r.G0;
+    double G_min_val = r.G0;
 
     for (int k = 0; k < n_segments; k++) {
-        double d_k = course[k].distance;
-        double i_k = course[k].slope;
-        if (i_k > MAX_SLOPE) {
-            i_k = MAX_SLOPE;
-        } else if (i_k < -MAX_SLOPE) {
-            i_k = -MAX_SLOPE;
+        SegmentState st = solve_segment(r, course[k].slope, M_target);
+        if (st.speed_ms < MIN_SPEED_MS) {
+            st.speed_ms = MIN_SPEED_MS;
         }
 
-        /* Terrain and progressive fatigue drift evaluated at segment midpoint (capped at +15%) */
-        double dist_mid_km = (cum_dist + 0.5 * d_k) / 1000.0;
-        double fatigue_add = r.fatigue_rate * dist_mid_km;
-        if (fatigue_add > FATIGUE_CAP) {
-            fatigue_add = FATIGUE_CAP;
-        }
-        double cost_mult = r.terrain_factor * (1.0 + fatigue_add);
+        double dt    = course[k].distance / st.speed_ms;
+        double I_k   = st.M_actual / M_max;
+        double fc    = rapoport_cho_fraction(I_k);
+        double R_out = (r.mass * st.M_actual * fc) / GLYCOGEN_ENERGY;
 
-        /* 1. Metabolic speed & uphill walk-run transition */
-        double c_eff      = minetti_run(i_k) * cost_mult;
-        double v_k        = P_target / (c_eff * r.mass);
-        double is_walking = 0.0;
+        t_acc     += dt;
+        d_acc     += course[k].distance;
+        G_current += (R_exo - R_out) * dt;
 
-        if (i_k > MIN_WALK_SLOPE && v_k <= v_trans) {
-            c_eff      = minetti_walk(i_k) * cost_mult;
-            v_k        = P_target / (c_eff * r.mass);
-            is_walking = 1.0;
-        }
-
-        /* 2. Downhill biomechanical braking limit */
-        if (i_k < 0.0) {
-            double v_flat_I       = P_target / (c_flat_0 * cost_mult * r.mass);
-            double v_downhill_max = v_flat_I / downhill_pace_factor(i_k);
-            if (v_k > v_downhill_max) {
-                v_k = v_downhill_max;
-            }
-        }
-
-        /* 3. Local metabolic power (net + BMR) & CHO oxidation (Romijn et al., 1993) */
-        double P_net = c_eff * r.mass * v_k;
-        double I_k   = P_net / P_max;
-        if (I_k > 1.0) {
-            I_k = 1.0;
-        } else if (I_k < 0.0) {
-            I_k = 0.0;
-        }
-
-        double dt     = d_k / v_k;
-        double Rout_s = ((P_net + P_bmr) * pow(I_k, CHO_FRAC_EXP)) / GLYCOGEN_ENERGY;
-
-        cum_dist  += d_k;
-        cum_time  += dt;
-        G_current += (Rin_net_s - Rout_s) * dt;
-
-        if (G_current > r.G0) {
-            G_current = r.G0;
-        }
-        if (G_current < g_min_val) {
-            g_min_val = G_current;
-        }
+        if (G_current > r.G0)      G_current = r.G0;
+        if (G_current < G_min_val) G_min_val = G_current;
 
         if (prof != NULL) {
-            prof->cum_dist_m[k]      = cum_dist;
-            prof->cum_time_s[k]      = cum_time;
-            prof->speed_ms[k]        = v_k;
-            prof->is_walking[k]      = is_walking;
+            prof->cum_dist_m[k]      = d_acc;
+            prof->cum_time_s[k]      = t_acc;
+            prof->speed_ms[k]        = st.speed_ms;
+            prof->is_walking[k]      = st.is_walking;
             prof->local_intensity[k] = I_k;
             prof->glycogen_g[k]      = G_current;
         }
     }
 
-    *t_tot   = cum_time;
-    *G_final = G_current;
-    *G_min   = g_min_val;
+    if (t_tot   != NULL) *t_tot   = t_acc;
+    if (G_final != NULL) *G_final = G_current;
+    if (G_min   != NULL) *G_min   = G_min_val;
 }
 
-/* Finds the optimal intensity I via binary search so that G_final = 10% of G0 */
-Result find_I_opt(Runner r, const Segment course[], int n_segments) {
-    const double tol     = 1e-5;
-    const int max_iter   = 100;
-    const double G_floor = WALL_THRESHOLD * r.G0;
-
-    double t_tmp = 0.0;
-    double g_fin_tmp = 0.0;
+double solve_I_glyc(Runner r, const Segment course[], int n_segments, double M_max) {
+    double I_min = (LCDA_STANDING_M / M_max) + 0.01;
+    double G_floor   = WALL_THRESHOLD * r.G0;
     double g_min_tmp = 0.0;
 
-    /* --- 1. Bisection for glycogen constraint (G_min >= 10% of G0) --- */
-    double low  = 0.05;
-    double high = 1.0;
+    double high  = 1.0;
+    double low   = I_min;
 
-    for (int iter = 0; iter < max_iter && (high - low) > tol; iter++) {
+    for (int iter = 0; iter < OUTER_BISECT_ITERS; iter++) {
         double mid = 0.5 * (low + high);
-        simulate_course(r, course, n_segments, mid, &t_tmp, &g_fin_tmp, &g_min_tmp, NULL);
+        simulate_course(r, course, n_segments, mid, NULL, NULL, &g_min_tmp, NULL);
         if (g_min_tmp >= G_floor) {
             low = mid;
         } else {
             high = mid;
         }
     }
-    double I_glyc = low;
+    return low;
+}
 
-    /* --- 2. Bisection for Peronnet-Thibault aerobic endurance limit ---
-     * Solves I = I_max(t(I)), where t(I) is the
-     * predicted race duration at target intensity I.
-     */
-    double low  = fabs(r.endurance_index) / 100.0;
-    double high = 1.0;
-
-    for (int iter = 0; iter < max_iter && (high - low) > tol; iter++) {
+double solve_I_aero(Runner r, const Segment course[], int n_segments, double M_max) {
+    double E     = r.endurance_index;
+    double low = (LCDA_STANDING_M / M_max) + 0.01;
+    if (-E / 100.0 > low) low = -E / 100.0;
+    double t_tmp = 0.0;
+    double high  = 1.0;
+   
+    for (int iter = 0; iter < OUTER_BISECT_ITERS; iter++) {
         double mid = 0.5 * (low + high);
-        simulate_course(r, course, n_segments, mid, &t_tmp, &g_fin_tmp, &g_min_tmp, NULL);
-        if (mid < peronnet_I_max(t_tmp, r.endurance_index)) { 
+        simulate_course(r, course, n_segments, mid, &t_tmp, NULL, NULL, NULL);
+        if (mid < peronnet_I_max(t_tmp, E)) {
             low = mid;
         } else {
             high = mid;
         }
     }
-    double I_aero = low;
+    return low;
+}
 
-    /* --- 3. Select dominant constraint & run final evaluation --- */
+Result find_I_opt(Runner r, const Segment course[], int n_segments) {
     Result res;
-    res.I_glyc = I_glyc;
-    res.I_aero = I_aero;
+    res.I_opt   = 0.0;
+    res.I_glyc  = 0.0;
+    res.I_aero  = 0.0;
+    res.t_tot   = 0.0;
+    res.G_final = r.G0;
+    res.G_min   = r.G0;
+    res.limiter = LIMIT_AEROBIC;
 
-    if (I_glyc < I_aero) {
-        res.I_opt   = I_glyc;
+    double M_max = compute_M_max(r);
+
+    res.I_glyc = solve_I_glyc(r, course, n_segments, M_max);
+    res.I_aero = solve_I_aero(r, course, n_segments, M_max);
+
+    if (res.I_glyc < res.I_aero) {
+        res.I_opt   = res.I_glyc;
         res.limiter = LIMIT_GLYCOGEN;
     } else {
-        res.I_opt   = I_aero;
+        res.I_opt   = res.I_aero;
         res.limiter = LIMIT_AEROBIC;
     }
 
     simulate_course(r, course, n_segments, res.I_opt,
                     &res.t_tot, &res.G_final, &res.G_min, NULL);
-
     return res;
 }
