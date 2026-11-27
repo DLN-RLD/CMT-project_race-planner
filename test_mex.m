@@ -1,4 +1,4 @@
-clear; clc;
+clear;
 
 addpath("bin");
 if ~isfile(fullfile("bin", "mex_solver." + mexext))
@@ -6,14 +6,17 @@ if ~isfile(fullfile("bin", "mex_solver." + mexext))
 end
 
 % Parcours test
-distances = [20000; 20000; 10000];
+distances = [15000; 10000; 15000];
 slopes    = [0.10;    0.00; -0.10];
 
 % Profil coureur
 runner.mass   = 70.0;
-runner.vma    = 17.0;
+runner.vma    = 20.0;
 runner.height = 1.75;
 runner.G0     = 400.0;
+runner.endurance_index = -7.5;    % -5 à -6 : très endurant | -7 à -8 : entraîné | -9 à -10 : peu endurant
+runner.terrain_factor  = 1.20;    % 1.00 : bitume | 1.10 : sentier roulant | 1.20 : technique
+runner.fatigue_rate    = 0.010;  % mettre 0 pour désactiver la dérive de fatigue, max = 0.15
 
 
 % Comparaison des stratégies glucidiques

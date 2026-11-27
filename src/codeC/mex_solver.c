@@ -85,6 +85,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
             "local_intensity", "glycogen_g",
             "G_min_g", "I_glyc", "I_aero", "limiting_factor"
         };
+        // create a struct with 10 fields for the runner profile output
         plhs[3] = mxCreateStructMatrix(1, 1, 10, field_names);
 
         mxArray *mx_dist = mxCreateDoubleMatrix(n, 1, mxREAL);
@@ -103,6 +104,7 @@ void mexFunction(int nlhs, mxArray *plhs[],
         prof.glycogen_g      = mxGetDoubles(mx_glyc);
 
         double t_tmp = 0.0, g_fin_tmp = 0.0, g_min_tmp = 0.0;
+        // call simulate_course to fill the runner profile arrays
         simulate_course(r, course, (int)n, res.I_opt,
                         &t_tmp, &g_fin_tmp, &g_min_tmp, &prof);
 

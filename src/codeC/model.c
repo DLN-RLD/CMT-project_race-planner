@@ -35,7 +35,6 @@ double compute_Pmax(Runner r) {
         fprintf(stderr, "Error: provide a valid VMA (> 0) or VO2max (> 0).\n");
         return -1.0;
     }
-
     // Convert to m/s and compute P_max
     double vma_ms = vma_kmh / 3.6;
     pmax = minetti_run(0.0) * r.mass * vma_ms;
@@ -66,11 +65,14 @@ double compute_carb_efficiency(double Rin_h) {
         return 90.0 / Rin_h;
     }
 }
-
+/* returns the maximum fraction of VMA that a runner with an endurance index 
+ *is physiologically capable of maintaining continuously.
+ */
 double peronnet_I_max(double t_s, double endurance_index) {
     if (t_s <= PERONNET_T_MAP) {
         return 1.0;
     }
+    // val decreases logarithmically with time
     double val = 1.0 + (endurance_index / 100.0) * log(t_s / PERONNET_T_MAP);
     if (val > 1.0) {
         return 1.0;
@@ -88,18 +90,18 @@ double peronnet_I_max(double t_s, double endurance_index) {
 void simulate_course(Runner r, const Segment course[], int n_segments,
                      double I_target, double *t_tot, double *G_final,
                      double *G_min, ProfileArrays *prof) {
-    double P_max = compute_Pmax(r);
-    double P_target = P_max * I_target;
-    double v_trans = compute_v_trans(r.height);
-    double eta = compute_carb_efficiency(r.Rin_h);
-    double Rin_s = r.Rin_h / 3600.0; // Convert g
-    double P_bmr = BMR_PER_KG * r.mass; // Resting metabolic rate [W]
+    double P_max     = compute_Pmax(r);
+    double P_target  = P_max * I_target;
+    double v_trans   = compute_v_trans(r.height);
+    double Rin_net_s = compute_carb_efficiency(r.Rin_h) * (r.Rin_h / 3600.0); 
+    double P_bmr     = BMR_PER_KG * r.mass;                                   
+    double c_flat_0  = minetti_run(0.0);
 
-    double cum_dist = 0.0;
-    double cum_time = 0.0;
+    double cum_dist  = 0.0;
+    double cum_time  = 0.0;
     double G_current = r.G0;
     double g_min_val = r.G0;
-    
+
     for (int k = 0; k < n_segments; k++) {
         double d_k = course[k].distance;
         double i_k = course[k].slope;
@@ -109,7 +111,7 @@ void simulate_course(Runner r, const Segment course[], int n_segments,
             i_k = -MAX_SLOPE;
         }
 
-        /* Progressive fatigue drift evaluated at segment midpoint, capped at +15% */
+        /* Terrain and progressive fatigue drift evaluated at segment midpoint (capped at +15%) */
         double dist_mid_km = (cum_dist + 0.5 * d_k) / 1000.0;
         double fatigue_add = r.fatigue_rate * dist_mid_km;
         if (fatigue_add > FATIGUE_CAP) {
@@ -117,48 +119,41 @@ void simulate_course(Runner r, const Segment course[], int n_segments,
         }
         double cost_mult = r.terrain_factor * (1.0 + fatigue_add);
 
-        double c_run = minetti_run(i_k) * cost_mult;
-        double c_walk = minetti_walk(i_k) * cost_mult;
-        double c_flat = minetti_run(0.0) * cost_mult;
-
-        /* 1. Metabolic speed & uphill walk-run transition*/
-        double v_k = P_target / (c_run * r.mass);
+        /* 1. Metabolic speed & uphill walk-run transition */
+        double c_eff      = minetti_run(i_k) * cost_mult;
+        double v_k        = P_target / (c_eff * r.mass);
         double is_walking = 0.0;
-        double c_eff = c_run;
 
         if (i_k > MIN_WALK_SLOPE && v_k <= v_trans) {
-            v_k = P_target / (c_walk * r.mass);
+            c_eff      = minetti_walk(i_k) * cost_mult;
+            v_k        = P_target / (c_eff * r.mass);
             is_walking = 1.0;
-            c_eff = c_walk;
         }
 
         /* 2. Downhill biomechanical braking limit */
         if (i_k < 0.0) {
-            double v_flat_I = P_target / (c_flat * r.mass);
-            double v_downhill_max = v_flat_I * downhill_pace_factor(i_k);
+            double v_flat_I       = P_target / (c_flat_0 * cost_mult * r.mass);
+            double v_downhill_max = v_flat_I / downhill_pace_factor(i_k);
             if (v_k > v_downhill_max) {
                 v_k = v_downhill_max;
             }
         }
-        
-        /* 3. Local metabolic power and glycogen balance (Brooks crossover I^2) */
+
+        /* 3. Local metabolic power (net + BMR) & CHO oxidation (Romijn et al., 1993) */
         double P_net = c_eff * r.mass * v_k;
-        double I_k = P_net / P_max;
+        double I_k   = P_net / P_max;
         if (I_k > 1.0) {
             I_k = 1.0;
         } else if (I_k < 0.0) {
             I_k = 0.0;
         }
 
-        double P_tot = P_net + P_bmr;
-        double f_cho = pow(I_k, CHO_FRAC_EXP); // I^1,5 instead of I^2
+        double dt     = d_k / v_k;
+        double Rout_s = ((P_net + P_bmr) * pow(I_k, CHO_FRAC_EXP)) / GLYCOGEN_ENERGY;
 
-        double dt = d_k / v_k;
-        double Rout_s = (P_tot * f_cho) / GLYCOGEN_ENERGY; // repalce I^2 by f_cho
-
-        cum_dist += d_k;
-        cum_time += dt;
-        G_current += (eta * Rin_s - Rout_s) * dt;
+        cum_dist  += d_k;
+        cum_time  += dt;
+        G_current += (Rin_net_s - Rout_s) * dt;
 
         if (G_current > r.G0) {
             G_current = r.G0;
@@ -168,20 +163,19 @@ void simulate_course(Runner r, const Segment course[], int n_segments,
         }
 
         if (prof != NULL) {
-            prof->cum_dist_m[k] = cum_dist;
-            prof->cum_time_s[k] = cum_time;
-            prof->speed_ms[k] = v_k;
-            prof->is_walking[k] = is_walking;
+            prof->cum_dist_m[k]      = cum_dist;
+            prof->cum_time_s[k]      = cum_time;
+            prof->speed_ms[k]        = v_k;
+            prof->is_walking[k]      = is_walking;
             prof->local_intensity[k] = I_k;
-            prof->glycogen_g[k] = G_current;
-        }   
+            prof->glycogen_g[k]      = G_current;
+        }
     }
 
-    *t_tot = cum_time;
+    *t_tot   = cum_time;
     *G_final = G_current;
-    *G_min = g_min_val;
+    *G_min   = g_min_val;
 }
-
 
 /* Finds the optimal intensity I via binary search so that G_final = 10% of G0 */
 Result find_I_opt(Runner r, const Segment course[], int n_segments) {
@@ -194,53 +188,37 @@ Result find_I_opt(Runner r, const Segment course[], int n_segments) {
     double g_min_tmp = 0.0;
 
     /* --- 1. Bisection for glycogen constraint (G_min >= 10% of G0) --- */
-    double I_glyc = 1.0;
-    simulate_course(r, course, n_segments, 1.0, &t_tmp, &g_fin_tmp, &g_min_tmp, NULL);
-    if (g_min_tmp < G_floor) {
-        double low = 0.05;
-        double high = 1.0;
-        for (int iter = 0; iter < max_iter && (high - low) > tol; iter++) {
-            double mid = 0.5 * (low + high);
-            simulate_course(r, course, n_segments, mid, &t_tmp, &g_fin_tmp, &g_min_tmp, NULL);
-            if (g_min_tmp > G_floor) {
-                low = mid;
-            } else {
-                high = mid;
-            }
-        }
-        I_glyc = 0.5 * (low + high);
-    }
+    double low  = 0.05;
+    double high = 1.0;
 
-    /* --- 2. Bisection for Peronnet-Thibault aerobic endurance limit --- */
-    double I_aero = 1.0;
-    simulate_course(r, course, n_segments, 1.0, &t_tmp, &g_fin_tmp, &g_min_tmp, NULL);
-    if (1.0 > peronnet_I_max(t_tmp, r.endurance_index)) {
-        /* Lower bound at |E|/100 guarantees strict monotonicity of I - I_max(t(I)) */
-        double low = fabs(r.endurance_index) / 100.0;
-        if (low < 0.05) {
-            low = 0.05;
-        }
-        if (low > 0.99) {
-            low = 0.99;
-        }
-        double high = 1.0;
-
-        simulate_course(r, course, n_segments, low, &t_tmp, &g_fin_tmp, &g_min_tmp, NULL);
-        if (low >= peronnet_I_max(t_tmp, r.endurance_index)) {
-            I_aero = low;
+    for (int iter = 0; iter < max_iter && (high - low) > tol; iter++) {
+        double mid = 0.5 * (low + high);
+        simulate_course(r, course, n_segments, mid, &t_tmp, &g_fin_tmp, &g_min_tmp, NULL);
+        if (g_min_tmp >= G_floor) {
+            low = mid;
         } else {
-            for (int iter = 0; iter < max_iter && (high - low) > tol; iter++) {
-                double mid = 0.5 * (low + high);
-                simulate_course(r, course, n_segments, mid, &t_tmp, &g_fin_tmp, &g_min_tmp, NULL);
-                if (mid < peronnet_I_max(t_tmp, r.endurance_index)) {
-                    low = mid;
-                } else {
-                    high = mid;
-                }
-            }
-            I_aero = 0.5 * (low + high);
+            high = mid;
         }
     }
+    double I_glyc = low;
+
+    /* --- 2. Bisection for Peronnet-Thibault aerobic endurance limit ---
+     * Solves I = I_max(t(I)), where t(I) is the
+     * predicted race duration at target intensity I.
+     */
+    double low  = fabs(r.endurance_index) / 100.0;
+    double high = 1.0;
+
+    for (int iter = 0; iter < max_iter && (high - low) > tol; iter++) {
+        double mid = 0.5 * (low + high);
+        simulate_course(r, course, n_segments, mid, &t_tmp, &g_fin_tmp, &g_min_tmp, NULL);
+        if (mid < peronnet_I_max(t_tmp, r.endurance_index)) { 
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    double I_aero = low;
 
     /* --- 3. Select dominant constraint & run final evaluation --- */
     Result res;
